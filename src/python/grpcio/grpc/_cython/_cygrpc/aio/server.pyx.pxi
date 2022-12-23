@@ -16,6 +16,7 @@
 import inspect
 import traceback
 import functools
+import logging
 
 
 cdef int _EMPTY_FLAG = 0
@@ -950,7 +951,9 @@ cdef class AioServer:
                 await self._limiter.check_before_request_call()
 
             # Accepts new request from Core
+            logging.info('before call')
             rpc_state = await self._request_call()
+            logging.info('after call')
 
             # Creates the dedicated RPC coroutine. If we schedule it right now,
             # there is no guarantee if the cancellation listening coroutine is
