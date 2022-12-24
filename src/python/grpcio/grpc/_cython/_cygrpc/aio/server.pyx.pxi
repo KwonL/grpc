@@ -17,6 +17,76 @@ import inspect
 import traceback
 import functools
 import logging
+from opentelemetry import trace
+from contextlib import contextmanager
+from opentelemetry.propagate import extract
+
+
+tracer: trace.Tracer = trace.get_tracer(__name__)
+
+
+def setup_tracing_ctx_from_grpc_context(
+    context
+):
+    meta = context
+    if meta is not None:
+        meta_dict = dict(meta)
+        if 'traceparent' in meta_dict:
+            return extract(meta_dict)
+    return None
+
+
+@contextmanager
+def start_as_current_span_if_ctx(
+    tracer,
+    name,
+    context,
+    kind=trace.SpanKind.SERVER,
+    attributes=None,
+    links=(),
+    start_time=None,
+    record_exception=True,
+    set_status_on_exception=True,
+    end_on_exit=True,
+):
+    """
+    Create new span and start it using context manager.
+
+    This function is to be used when tracing context is received from
+    other modules over the network. When empty tracing context is received,
+    (it means trace is NOT sampled!), call this function with 'context' set to 'None'.
+
+    This way, we can create 'NonRecordingSpan' straight away and avoid spending
+    time on context creation (including trace and span id generation) and sampling.
+    Moreover, almost all methods of 'NonRecordingSpan' are no-op.
+    """
+    span: trace.Span
+    if context is None:
+        span = trace.INVALID_SPAN
+    else:
+        # We know that if code comes here, span is sampled.
+        assert isinstance(name, str)
+
+        span = tracer.start_span(
+            name,
+            context,
+            kind,
+            attributes,
+            links,
+            start_time,
+            record_exception,
+            set_status_on_exception,
+        )
+
+        assert span.is_recording()  # recording implies sampled
+
+    with trace.use_span(
+        span,
+        end_on_exit=end_on_exit,
+        record_exception=record_exception,
+        set_status_on_exception=set_status_on_exception,
+    ) as span_context:
+        yield span_context
 
 
 cdef int _EMPTY_FLAG = 0
@@ -400,6 +470,7 @@ async def _finish_handler_with_unary_response(RPCState rpc_state,
     cdef object response_message
     cdef _SyncServicerContext sync_servicer_context
 
+    logging.info(f'calling {unary_handler}')
     if _is_async_handler(unary_handler):
         # Run async method handlers in this coroutine
         response_message = await unary_handler(
@@ -418,6 +489,7 @@ async def _finish_handler_with_unary_response(RPCState rpc_state,
         # Support sync-stack callback
         for callback in sync_servicer_context._callbacks:
             callback()
+    logging.info(f'Ended handling')
 
     # Raises exception if aborted
     rpc_state.raise_for_termination()
@@ -451,6 +523,7 @@ async def _finish_handler_with_unary_response(RPCState rpc_state,
     rpc_state.metadata_sent = True
     rpc_state.status_sent = True
     await execute_batch(rpc_state, finish_ops, loop)
+    logging.info(f'All response sent for')
 
 
 async def _finish_handler_with_stream_responses(RPCState rpc_state,
@@ -525,7 +598,9 @@ async def _handle_unary_unary_rpc(object method_handler,
                                   RPCState rpc_state,
                                   object loop):
     # Receives request message
+    logging.info(f'started handling unary unary')
     cdef bytes request_raw = await _receive_message(rpc_state, loop)
+    logging.info(f'received all msg')
     if request_raw is None:
         # The RPC was cancelled immediately after start on client side.
         return
@@ -535,6 +610,7 @@ async def _handle_unary_unary_rpc(object method_handler,
         method_handler.request_deserializer,
         request_raw,
     )
+    logging.info(f'deserialize')
 
     # Creates a dedecated ServicerContext
     cdef _ServicerContext servicer_context = _ServicerContext(
@@ -771,54 +847,57 @@ async def _schedule_rpc_coro(object rpc_coro,
 
 
 async def _handle_rpc(list generic_handlers, tuple interceptors,
-                      RPCState rpc_state, object loop):
+                      RPCState rpc_state, object loop, object context):
     cdef object method_handler
-    # Finds the method handler (application logic)
-    method_handler = await _find_method_handler(
-        rpc_state.method().decode(),
-        rpc_state.invocation_metadata(),
-        generic_handlers,
-        interceptors,
-    )
-    if method_handler is None:
-        rpc_state.status_sent = True
-        await _send_error_status_from_server(
-            rpc_state,
-            StatusCode.unimplemented,
-            'Method not found!',
-            _IMMUTABLE_EMPTY_METADATA,
-            rpc_state.create_send_initial_metadata_op_if_not_sent(),
-            loop
+    with start_as_current_span_if_ctx(tracer, 'inner.handle_grpc', context=context):
+        # Finds the method handler (application logic)
+        logging.info(f'staring handler')
+        method_handler = await _find_method_handler(
+            rpc_state.method().decode(),
+            rpc_state.invocation_metadata(),
+            generic_handlers,
+            interceptors,
         )
-        return
+        logging.info(f'method found: {method_handler}')
+        if method_handler is None:
+            rpc_state.status_sent = True
+            await _send_error_status_from_server(
+                rpc_state,
+                StatusCode.unimplemented,
+                'Method not found!',
+                _IMMUTABLE_EMPTY_METADATA,
+                rpc_state.create_send_initial_metadata_op_if_not_sent(),
+                loop
+            )
+            return
 
-    # Handles unary-unary case
-    if not method_handler.request_streaming and not method_handler.response_streaming:
-        await _handle_unary_unary_rpc(method_handler,
-                                      rpc_state,
-                                      loop)
-        return
-
-    # Handles unary-stream case
-    if not method_handler.request_streaming and method_handler.response_streaming:
-        await _handle_unary_stream_rpc(method_handler,
-                                       rpc_state,
-                                       loop)
-        return
-
-    # Handles stream-unary case
-    if method_handler.request_streaming and not method_handler.response_streaming:
-        await _handle_stream_unary_rpc(method_handler,
-                                       rpc_state,
-                                       loop)
-        return
-
-    # Handles stream-stream case
-    if method_handler.request_streaming and method_handler.response_streaming:
-        await _handle_stream_stream_rpc(method_handler,
+        # Handles unary-unary case
+        if not method_handler.request_streaming and not method_handler.response_streaming:
+            await _handle_unary_unary_rpc(method_handler,
                                         rpc_state,
                                         loop)
-        return
+            return
+
+        # Handles unary-stream case
+        if not method_handler.request_streaming and method_handler.response_streaming:
+            await _handle_unary_stream_rpc(method_handler,
+                                        rpc_state,
+                                        loop)
+            return
+
+        # Handles stream-unary case
+        if method_handler.request_streaming and not method_handler.response_streaming:
+            await _handle_stream_unary_rpc(method_handler,
+                                        rpc_state,
+                                        loop)
+            return
+
+        # Handles stream-stream case
+        if method_handler.request_streaming and method_handler.response_streaming:
+            await _handle_stream_stream_rpc(method_handler,
+                                            rpc_state,
+                                            loop)
+            return
 
 
 class _RequestCallError(Exception): pass
@@ -951,9 +1030,10 @@ cdef class AioServer:
                 await self._limiter.check_before_request_call()
 
             # Accepts new request from Core
-            logging.info('before call')
             rpc_state = await self._request_call()
-            logging.info('after call')
+            context = setup_tracing_ctx_from_grpc_context(rpc_state.invocation_metadata())
+            with start_as_current_span_if_ctx(tracer, 'inner.grpc', context=context):
+                logging.info(f'got request')
 
             # Creates the dedicated RPC coroutine. If we schedule it right now,
             # there is no guarantee if the cancellation listening coroutine is
@@ -963,7 +1043,8 @@ cdef class AioServer:
             rpc_coro = _handle_rpc(self._generic_handlers,
                                    self._interceptors,
                                    rpc_state,
-                                   self._loop)
+                                   self._loop,
+                                   context)
 
             # Fires off a task that listens on the cancellation from client.
             rpc_task = self._loop.create_task(
